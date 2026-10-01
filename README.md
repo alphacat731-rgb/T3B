@@ -90,6 +90,7 @@ For classic ASCII mode:
 | R | Reset + refit view |
 | 1 | Braille / ASCII |
 | 2 | Cycle terminal colour |
+| K | Cycle quality: AUTO / HIGH / MED / LOW |
 | H / ? | Help |
 | Q / Esc | Quit |
 
@@ -105,7 +106,7 @@ Useful options:
 
 Lower \`--edges\` on very dense models. A larger edge budget gives more mesh detail but costs more CPU time on small ARM boards.
 
-The default edge budget is 9000.
+The configured edge budget defaults to 14000. AUTO starts lower on complex meshes and raises/lowers the active budget as performance changes.
 
 ## Requirements
 
