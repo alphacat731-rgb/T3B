@@ -10,9 +10,17 @@ The default renderer is a **fine Braille wireframe**. A Braille terminal cell pr
 
 The viewer also includes a classic ASCII-dot mode for terminals where Braille characters are unavailable or render badly.
 
-The renderer now automatically recenters imported geometry and calculates a camera distance from the model bounds, so large or strangely scaled assets should start out filling the screen instead of appearing as a tiny speck.
+Imported geometry is automatically recentered and fitted to the viewport, so assets with unusual scene scales should start out filling the screen instead of appearing as a tiny speck.
 
-For dense meshes, T3B limits the number of rendered edges. Its sampler preserves many of the longest structural edges while spreading the rest across the mesh, helping silhouettes survive aggressive edge limits.
+For dense meshes, T3B scores edges using length, mesh borders and sharp creases, then samples the remaining topology. This keeps more visually useful structure when the renderer has to reduce the edge budget.
+
+T3B also caches the rendered model frame while the camera is idle. A stationary model therefore does not continuously re-rasterize itself just to update the terminal.
+
+### Adaptive quality
+
+The default AUTO quality mode starts at a moderate edge budget and adjusts it toward a target render rate. It reduces geometry when the machine is overloaded and gradually restores detail when there is headroom.
+
+Press K during viewing to cycle through AUTO, HIGH, MED and LOW. HIGH uses the full configured edge budget for maximum wireframe detail; AUTO is intended for small boards such as the Raspberry Pi 3B.
 
 ## Formats
 
@@ -93,6 +101,7 @@ Useful options:
 
     python3 t3b.py model.fbx --edges 6000 --fps 20
     python3 t3b.py model.glb --edges 12000 --fps 30
+    python3 t3b.py model.fbx --quality high
 
 Lower \`--edges\` on very dense models. A larger edge budget gives more mesh detail but costs more CPU time on small ARM boards.
 
