@@ -487,6 +487,8 @@ def render_wire(
     fov: float,
     ascii_mode: bool,
     edge_limit: int,
+    pan_x: float = 0.0,
+    pan_y: float = 0.0,
 ) -> list[str]:
     global RASTER_W
     rw, rh = (view_w, view_h) if ascii_mode else (view_w * 2, view_h * 4)
@@ -495,6 +497,13 @@ def render_wire(
     depths = [float("inf")] * (rw * rh)
 
     projected = [project(v, yaw, pitch, roll, cam_dist, rw, rh, fov) for v in mesh.vertices]
+    pan_px = (pan_x / max(mesh.radius, 1e-6)) * rw * 0.5
+    pan_py = (pan_y / max(mesh.radius, 1e-6)) * rh * 0.5
+    if pan_x or pan_y:
+        projected = [
+            None if p is None else (p[0] + pan_px, p[1] - pan_py, p[2])
+            for p in projected
+        ]
     for a, b in mesh.limited_edges(edge_limit):
         pa, pb = projected[a], projected[b]
         if pa is not None and pb is not None:
@@ -544,6 +553,9 @@ class Viewer:
         self.fov = max(25.0, min(110.0, fov))
         self.yaw, self.pitch, self.roll = 0.45, -0.25, 0.0
         self.zoom = 3.0
+        self.pan_x = self.pan_y = 0.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
         self.auto_rotate = False
         self.help = False
         self.theme = 0
@@ -568,9 +580,9 @@ class Viewer:
         elif ch == curses.KEY_DOWN:
             self.pitch = min(1.50, self.pitch + 0.08)
         elif ch in (ord("a"), ord("A")):
-            self.yaw -= 0.0
+            self.pan_x -= 0.08 * self.model.radius
         elif ch in (ord("d"), ord("D")):
-            self.yaw += 0.0
+            self.pan_x += 0.08 * self.model.radius
         elif ch in (ord("w"), ord("W")):
             self.zoom = max(1.1, self.zoom * 0.92)
         elif ch in (ord("s"), ord("S")):
@@ -681,6 +693,7 @@ class Viewer:
         rows = render_wire(
             self.model, self.yaw, self.pitch, self.roll, cam_dist,
             w, view_h, self.fov, self.ascii_mode, self.edge_limit,
+            self.pan_x, self.pan_y,
         )
         attr = curses.A_NORMAL | (curses.color_pair(1 + self.theme) if curses.has_colors() else 0)
         for y, row in enumerate(rows):
@@ -717,7 +730,8 @@ def main() -> int:
 
     try:
         mesh = load_model(args.model) if args.model else demo_mesh()
-        Viewer(mesh, args.ascii, args.fps, args.edges, args.fov).run_via_wrapper()
+        viewer = Viewer(mesh, args.ascii, args.fps, args.edges, args.fov)
+        curses.wrapper(viewer.run)
         return 0
     except KeyboardInterrupt:
         return 130
@@ -728,12 +742,6 @@ def main() -> int:
         print(f"T3B: terminal error: {exc}", file=sys.stderr)
         return 3
 
-
-def _run_via_wrapper(self: Viewer) -> None:
-    curses.wrapper(self.run)
-
-
-Viewer.run_via_wrapper = _run_via_wrapper
 
 
 if __name__ == "__main__":
