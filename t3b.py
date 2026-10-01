@@ -706,7 +706,7 @@ class Viewer:
         order = ("AUTO", "HIGH", "MED", "LOW")
         self.quality = order[(order.index(self.quality) + 1) % len(order)]
         if self.quality == "AUTO":
-            self.active_edge_limit = min(self.base_edge_limit, max(self.active_edge_limit, self.min_auto_edges))
+            self.active_edge_limit = min(self.base_edge_limit, 6500)
         else:
             self.active_edge_limit = max(
                 500,
