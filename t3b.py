@@ -51,12 +51,10 @@ class Mesh:
         self.center, self.radius = self._bounds(vertices)
         cx, cy, cz = self.center
         self.render_vertices = [(x - cx, y - cy, z - cz) for x, y, z in vertices]
-        self.edge_lengths = [
-            math.dist(vertices[a], vertices[b]) for a, b in self.edges
-        ]
-        self._edges_by_length = sorted(
+        self.edge_scores = self._score_edges(vertices, faces, self.edges)
+        self._edges_by_score = sorted(
             range(len(self.edges)),
-            key=self.edge_lengths.__getitem__,
+            key=self.edge_scores.__getitem__,
             reverse=True,
         )
 
@@ -68,6 +66,58 @@ class Mesh:
                 if u != v:
                     edges.add((min(u, v), max(u, v)))
         return list(edges)
+
+    @staticmethod
+    def _score_edges(
+        vertices: list[Vec3],
+        faces: list[Face],
+        edges: list[tuple[int, int]],
+    ) -> list[float]:
+        if not edges:
+            return []
+
+        edge_faces: dict[tuple[int, int], list[int]] = {}
+        for fi, (a, b, c) in enumerate(faces):
+            for u, v in ((a, b), (b, c), (c, a)):
+                if u == v:
+                    continue
+                key = (min(u, v), max(u, v))
+                edge_faces.setdefault(key, []).append(fi)
+
+        normals: list[Vec3] = []
+        for a, b, c in faces:
+            ax, ay, az = vertices[a]
+            bx, by, bz = vertices[b]
+            cx, cy, cz = vertices[c]
+            ux, uy, uz = bx - ax, by - ay, bz - az
+            vx, vy, vz = cx - ax, cy - ay, cz - az
+            nx, ny, nz = (
+                uy * vz - uz * vy,
+                uz * vx - ux * vz,
+                ux * vy - uy * vx,
+            )
+            length = math.sqrt(nx * nx + ny * ny + nz * nz)
+            if length > 1e-12:
+                normals.append((nx / length, ny / length, nz / length))
+            else:
+                normals.append((0.0, 0.0, 0.0))
+
+        scores: list[float] = []
+        for edge in edges:
+            a, b = edge
+            length = math.dist(vertices[a], vertices[b])
+            attached = edge_faces.get(edge, [])
+            structural = 1.0
+            if len(attached) == 1:
+                structural += 2.5  # open/border edge
+            elif len(attached) >= 2:
+                n1, n2 = normals[attached[0]], normals[attached[1]]
+                dot = max(-1.0, min(1.0, n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2]))
+                crease = 1.0 - abs(dot)
+                structural += crease * 1.75
+            scores.append(length * structural)
+
+        return scores
 
     @staticmethod
     def _bounds(vertices: list[Vec3]) -> tuple[Vec3, float]:
@@ -89,18 +139,19 @@ class Mesh:
     def limited_edges(self, limit: int) -> list[tuple[int, int]]:
         if limit <= 0 or len(self.edges) <= limit:
             return self.edges
+        if limit < 256:
+            return [self.edges[i] for i in self._edges_by_score[:limit]]
 
-        # Preserve long structural/silhouette edges, then spread the remaining
-        # budget across the whole mesh instead of taking every Nth edge.
-        long_count = max(1, int(limit * 0.65))
-        selected = set(self._edges_by_length[:long_count])
+        # Keep the strongest structural edges, then add a uniformly sampled
+        # cross-section of the remaining mesh so dense models retain detail.
+        structural_count = max(1, int(limit * 0.72))
+        selected = set(self._edges_by_score[:structural_count])
 
         remaining = limit - len(selected)
         if remaining > 0:
             step = len(self.edges) / remaining
             for i in range(remaining):
-                idx = min(len(self.edges) - 1, int(i * step))
-                selected.add(idx)
+                selected.add(min(len(self.edges) - 1, int(i * step)))
                 if len(selected) >= limit:
                     break
 
@@ -518,17 +569,19 @@ def render_wire(
     global RASTER_W
     rw, rh = (view_w, view_h) if ascii_mode else (view_w * 2, view_h * 4)
     RASTER_W = rw
-    points = [0] * (rw * rh)
+
+    points = bytearray(rw * rh)
     depths = [float("inf")] * (rw * rh)
 
     matrix = rotation_matrix(yaw, pitch, roll)
-    # A normal terminal cell is roughly 1 unit wide x 2 units tall.
-    # Braille's 2x4 raster preserves that same overall ratio.
+    # Braille's 2x4 dot cell is already close to the physical aspect ratio
+    # of a normal terminal cell. ASCII mode needs an extra vertical correction.
     aspect = (rw / max(rh, 1)) if not ascii_mode else (rw / max(rh * 2.0, 1.0))
     projected = [
         project(v, matrix, cam_dist, rw, rh, fov, aspect)
         for v in mesh.render_vertices
     ]
+
     pan_px = (pan_x / max(mesh.radius, 1e-6)) * rw * 0.5
     pan_py = (pan_y / max(mesh.radius, 1e-6)) * rh * 0.5
     if pan_x or pan_y:
@@ -536,10 +589,12 @@ def render_wire(
             None if p is None else (p[0] + pan_px, p[1] - pan_py, p[2])
             for p in projected
         ]
+
     for a, b in mesh.limited_edges(edge_limit):
         pa, pb = projected[a], projected[b]
-        if pa is not None and pb is not None:
-            raster_line(points, depths, pa[0], pa[1], pa[2], pb[0], pb[1], pb[2])
+        if pa is None or pb is None:
+            continue
+        raster_line(points, depths, pa[0], pa[1], pa[2], pb[0], pb[1], pb[2])
 
     if ascii_mode:
         return [
@@ -550,13 +605,15 @@ def render_wire(
     rows: list[str] = []
     for cy in range(view_h):
         row: list[str] = []
+        base_y = cy * 4 * rw
         for cx in range(view_w):
             mask = 0
-            for py in range(4):
-                base = (cy * 4 + py) * rw + cx * 2
+            x0 = cx * 2
+            for py, dy in enumerate((0, 1, 2, 3)):
+                base = base_y + dy * rw + x0
                 if points[base]:
                     mask |= BRAILLE_DOTS[(0, py)]
-                if base + 1 < len(points) and points[base + 1]:
+                if x0 + 1 < rw and points[base + 1]:
                     mask |= BRAILLE_DOTS[(1, py)]
             row.append(chr(0x2800 + mask) if mask else " ")
         rows.append("".join(row))
@@ -577,67 +634,128 @@ def demo_mesh() -> Mesh:
 
 
 class Viewer:
-    def __init__(self, model: Mesh, ascii_mode: bool, fps: int, edge_limit: int, fov: float):
+    QUALITY_PRESETS = {
+        "LOW": 0.28,
+        "MED": 0.50,
+        "HIGH": 1.00,
+        "AUTO": 1.00,
+    }
+
+    def __init__(
+        self,
+        model: Mesh,
+        ascii_mode: bool,
+        fps: int,
+        edge_limit: int,
+        fov: float,
+        quality: str = "AUTO",
+    ):
         self.model = model
         self.ascii_mode = ascii_mode
         self.max_fps = fps
-        self.edge_limit = max(100, edge_limit)
+        self.base_edge_limit = max(500, edge_limit)
+        self.active_edge_limit = self.base_edge_limit
+        self.quality = quality.upper()
         self.fov = max(25.0, min(110.0, fov))
         self.yaw, self.pitch, self.roll = 0.45, -0.25, 0.0
         self.fit_distance = self._calculate_fit_distance()
         self.zoom = 1.0
         self.pan_x = self.pan_y = 0.0
+
         self.auto_rotate = False
         self.help = False
         self.theme = 0
+        self.running = True
+
         self.last_fps = 0.0
+        self.render_ms = 0.0
         self.frame_count = 0
         self.fps_stamp = time.monotonic()
-        self.running = True
+        self.quality_stamp = self.fps_stamp
+        self.quality_good_time = 0.0
+
+        self.dirty = True
+        self.cached_rows: list[str] = []
+        self.cached_size = (0, 0)
+        self.status = "READY"
+
+        self.target_render_fps = 12.0
+        self.min_auto_edges = min(self.base_edge_limit, max(900, 1800))
+        self.max_auto_edges = self.base_edge_limit
 
     def _calculate_fit_distance(self) -> float:
         half_fov = math.radians(self.fov) * 0.5
         fit = self.model.radius / max(math.tan(half_fov), 0.05)
         return max(self.model.radius * 1.10, fit * 1.12)
 
+    def mark_dirty(self, reason: str = "UPDATED") -> None:
+        self.dirty = True
+        self.status = reason
+
     def reset(self) -> None:
         self.yaw, self.pitch, self.roll = 0.45, -0.25, 0.0
         self.zoom = 1.0
         self.pan_x = self.pan_y = 0.0
+        self.mark_dirty("RESET")
+
+    def cycle_quality(self) -> None:
+        order = ("AUTO", "HIGH", "MED", "LOW")
+        self.quality = order[(order.index(self.quality) + 1) % len(order)]
+        if self.quality == "AUTO":
+            self.active_edge_limit = min(self.base_edge_limit, max(self.active_edge_limit, self.min_auto_edges))
+        else:
+            self.active_edge_limit = max(
+                500,
+                int(self.base_edge_limit * self.QUALITY_PRESETS[self.quality]),
+            )
+        self.mark_dirty(f"QUALITY {self.quality}")
 
     def key(self, ch: int) -> None:
+        changed = False
+
         if ch in (27, ord("q"), ord("Q")):
             self.running = False
-        elif ch == curses.KEY_LEFT:
-            self.yaw -= 0.08
+            return
+        if ch == curses.KEY_LEFT:
+            self.yaw -= 0.08; changed = True
         elif ch == curses.KEY_RIGHT:
-            self.yaw += 0.08
+            self.yaw += 0.08; changed = True
         elif ch == curses.KEY_UP:
-            self.pitch = max(-1.50, self.pitch - 0.08)
+            self.pitch = max(-1.50, self.pitch - 0.08); changed = True
         elif ch == curses.KEY_DOWN:
-            self.pitch = min(1.50, self.pitch + 0.08)
+            self.pitch = min(1.50, self.pitch + 0.08); changed = True
         elif ch in (ord("a"), ord("A")):
-            self.pan_x -= 0.08 * self.model.radius
+            self.pan_x -= 0.08 * self.model.radius; changed = True
         elif ch in (ord("d"), ord("D")):
-            self.pan_x += 0.08 * self.model.radius
+            self.pan_x += 0.08 * self.model.radius; changed = True
         elif ch in (ord("w"), ord("W")):
-            self.zoom = max(0.45, self.zoom * 0.92)
+            self.zoom = max(0.45, self.zoom * 0.92); changed = True
         elif ch in (ord("s"), ord("S")):
-            self.zoom = min(8.0, self.zoom * 1.09)
+            self.zoom = min(8.0, self.zoom * 1.09); changed = True
         elif ch in (ord("z"), ord("Z")):
-            self.roll -= 0.10
+            self.roll -= 0.10; changed = True
         elif ch in (ord("c"), ord("C")):
-            self.roll += 0.10
+            self.roll += 0.10; changed = True
         elif ch == ord(" "):
             self.auto_rotate = not self.auto_rotate
+            self.mark_dirty("AUTO ROTATE" if self.auto_rotate else "PAUSED")
         elif ch in (ord("r"), ord("R")):
             self.reset()
+            return
         elif ch == ord("1"):
-            self.ascii_mode = not self.ascii_mode
+            self.ascii_mode = not self.ascii_mode; changed = True
         elif ch == ord("2"):
-            self.theme = (self.theme + 1) % 4
+            self.theme = (self.theme + 1) % 4; changed = True
+        elif ch in (ord("k"), ord("K")):
+            self.cycle_quality()
+            return
         elif ch in (ord("h"), ord("H"), ord("?")):
             self.help = not self.help
+            self.mark_dirty("HELP" if self.help else "READY")
+            return
+
+        if changed:
+            self.mark_dirty("MOVING" if not self.auto_rotate else "AUTO")
 
     def init_colors(self) -> None:
         if not curses.has_colors():
@@ -645,21 +763,149 @@ class Viewer:
         curses.start_color()
         curses.use_default_colors()
         for pair, color in enumerate(
-            (curses.COLOR_GREEN, curses.COLOR_WHITE, curses.COLOR_CYAN, curses.COLOR_YELLOW), 1
+            (curses.COLOR_GREEN, curses.COLOR_WHITE, curses.COLOR_CYAN, curses.COLOR_YELLOW),
+            1,
         ):
             curses.init_pair(pair, color, -1)
+
+    def color_attr(self, pair_offset: int = 1, bold: bool = False) -> int:
+        attr = curses.A_BOLD if bold else curses.A_NORMAL
+        if curses.has_colors():
+            attr |= curses.color_pair(pair_offset + self.theme)
+        return attr
+
+    def update_adaptive_quality(self, now: float) -> None:
+        if self.quality != "AUTO" or now - self.quality_stamp < 1.25:
+            return
+        self.quality_stamp = now
+
+        if self.last_fps < self.target_render_fps - 1.5:
+            new_limit = max(self.min_auto_edges, int(self.active_edge_limit * 0.78))
+            if new_limit < self.active_edge_limit:
+                self.active_edge_limit = new_limit
+                self.mark_dirty(f"AUTO {new_limit:,} EDGES")
+            self.quality_good_time = 0.0
+        elif self.last_fps > self.target_render_fps + 3.0:
+            self.quality_good_time += 1.25
+            if self.quality_good_time >= 3.0:
+                new_limit = min(self.max_auto_edges, int(self.active_edge_limit * 1.15) + 1)
+                if new_limit > self.active_edge_limit:
+                    self.active_edge_limit = new_limit
+                    self.mark_dirty(f"AUTO {new_limit:,} EDGES")
+                self.quality_good_time = 0.0
+        else:
+            self.quality_good_time = 0.0
+
+    def draw_help(self, stdscr: "curses.window", h: int, w: int) -> None:
+        stdscr.erase()
+        title = " T3B  /  HELP "
+        try:
+            stdscr.addnstr(0, 0, title.ljust(w), max(0, w - 1), self.color_attr(bold=True))
+        except curses.error:
+            pass
+
+        lines = [
+            "ARROWS  rotate        W/S  zoom",
+            "A/D     pan           Z/C  roll",
+            "SPACE   auto-rotate   K    quality: AUTO/HIGH/MED/LOW",
+            "1       Braille/ASCII 2    colour theme",
+            "R       reset + refit  H/?  toggle help",
+            "Q/ESC   quit",
+            "",
+            "BRAILLE mode uses a 2x4 terminal dot grid for the finest wireframe.",
+            "AUTO quality changes the edge budget to hold a practical FPS on small CPUs.",
+            "",
+            f"Model: {self.model.name}",
+            f"Vertices: {len(self.model.vertices):,}",
+            f"Triangles: {len(self.model.faces):,}",
+            f"Topology edges: {len(self.model.edges):,}",
+        ]
+
+        for y, line in enumerate(lines, 2):
+            if y >= h - 1:
+                break
+            try:
+                stdscr.addnstr(y, 2, line, max(0, w - 3), self.color_attr())
+            except curses.error:
+                pass
+
+    def render_frame(self, h: int, w: int) -> list[str]:
+        view_h = max(5, h - 3)
+        cam_dist = self.fit_distance * self.zoom
+        started = time.monotonic()
+
+        rows = render_wire(
+            self.model,
+            self.yaw,
+            self.pitch,
+            self.roll,
+            cam_dist,
+            w,
+            view_h,
+            self.fov,
+            self.ascii_mode,
+            self.active_edge_limit,
+            self.pan_x,
+            self.pan_y,
+        )
+
+        self.render_ms = (time.monotonic() - started) * 1000.0
+        self.cached_rows = rows
+        self.cached_size = (w, view_h)
+        self.dirty = False
+        return rows
+
+    def draw(self, stdscr: "curses.window", h: int, w: int) -> None:
+        stdscr.erase()
+        view_h = max(5, h - 3)
+
+        if self.dirty or self.cached_size != (w, view_h):
+            self.render_frame(h, w)
+
+        header = (
+            f" T3B  //  {self.model.name} "
+            f" //  {len(self.model.vertices):,}V {len(self.model.faces):,}F "
+            f" //  {self.last_fps:4.1f} FPS  {self.render_ms:6.1f}ms "
+        )
+        quality = (
+            f" MODE:{'ASCII' if self.ascii_mode else 'BRAILLE'}"
+            f"  QUALITY:{self.quality}"
+            f"  EDGES:{self.active_edge_limit:,}/{len(self.model.edges):,}"
+            f"  {'AUTO' if self.auto_rotate else self.status}"
+        )
+
+        if h >= 12:
+            try:
+                stdscr.addnstr(0, 0, header.ljust(w), max(0, w - 1), self.color_attr(bold=True))
+            except curses.error:
+                pass
+
+        for y, row in enumerate(self.cached_rows[:view_h], 1):
+            try:
+                stdscr.addnstr(y, 0, row, max(0, w - 1), self.color_attr())
+            except curses.error:
+                pass
+
+        try:
+            stdscr.addnstr(h - 2, 0, quality.ljust(w), max(0, w - 1), self.color_attr(bold=True))
+            controls = " ARROWS rotate  W/S zoom  A/D pan  Z/C roll  SPACE auto  K quality  1 mode  H help  Q quit "
+            stdscr.addnstr(h - 1, 0, controls.ljust(w), max(0, w - 1), self.color_attr(bold=True))
+        except curses.error:
+            pass
 
     def run(self, stdscr: "curses.window") -> None:
         self.init_colors()
         curses.curs_set(0)
         stdscr.nodelay(True)
         stdscr.keypad(True)
+
         frame_time = 1.0 / self.max_fps
         previous = time.monotonic()
 
         while self.running:
-            start = time.monotonic()
+            loop_start = time.monotonic()
             h, w = stdscr.getmaxyx()
+
             while True:
                 ch = stdscr.getch()
                 if ch == -1:
@@ -669,22 +915,32 @@ class Viewer:
             now = time.monotonic()
             dt = min(0.1, now - previous)
             previous = now
-            if self.auto_rotate:
-                self.yaw += dt * 0.85
 
-            if h < 8 or w < 30:
+            if self.auto_rotate and not self.help:
+                self.yaw += dt * 0.85
+                self.dirty = True
+
+            self.update_adaptive_quality(now)
+
+            if h < 10 or w < 42:
                 stdscr.erase()
+                msg = "T3B needs at least 42x10 terminal cells."
                 try:
-                    stdscr.addnstr(0, 0, "T3B needs at least 30x8 terminal cells. Resize me.", max(0, w - 1))
+                    stdscr.addnstr(0, 0, msg, max(0, w - 1), self.color_attr(bold=True))
                 except curses.error:
                     pass
-            elif self.help:
+                stdscr.refresh()
+                time.sleep(0.1)
+                continue
+
+            if self.help:
                 self.draw_help(stdscr, h, w)
             else:
                 self.draw(stdscr, h, w)
 
             stdscr.refresh()
-            elapsed = time.monotonic() - start
+
+            elapsed = time.monotonic() - loop_start
             if frame_time > elapsed:
                 time.sleep(frame_time - elapsed)
 
@@ -694,65 +950,6 @@ class Viewer:
                 self.frame_count = 0
                 self.fps_stamp = now
 
-    def draw_help(self, stdscr: "curses.window", h: int, w: int) -> None:
-        stdscr.erase()
-        lines = [
-            "T3B — TERMINAL 3D VIEWER",
-            "",
-            "Arrow keys   rotate model",
-            "W / S        zoom in / out",
-            "Z / C        roll",
-            "SPACE        auto-rotate",
-            "R            reset view",
-            "1            toggle Braille / ASCII",
-            "2            cycle terminal colour",
-            "H / ?        this help",
-            "Q / ESC      quit",
-            "",
-            f"Model: {self.model.name}",
-            f"Vertices: {len(self.model.vertices):,}",
-            f"Triangles: {len(self.model.faces):,}",
-            f"Edges: {len(self.model.edges):,} (showing up to {self.edge_limit:,})",
-        ]
-        attr = curses.A_BOLD | (curses.color_pair(1 + self.theme) if curses.has_colors() else 0)
-        for y, line in enumerate(lines):
-            if y >= h:
-                break
-            try:
-                stdscr.addnstr(y, 0, line, max(0, w - 1), attr if y == 0 else 0)
-            except curses.error:
-                pass
-
-    def draw(self, stdscr: "curses.window", h: int, w: int) -> None:
-        stdscr.erase()
-        view_h = h - 2
-        cam_dist = self.fit_distance * self.zoom
-        rows = render_wire(
-            self.model, self.yaw, self.pitch, self.roll, cam_dist,
-            w, view_h, self.fov, self.ascii_mode, self.edge_limit,
-            self.pan_x, self.pan_y,
-        )
-        attr = curses.A_NORMAL | (curses.color_pair(1 + self.theme) if curses.has_colors() else 0)
-        for y, row in enumerate(rows):
-            try:
-                stdscr.addnstr(y, 0, row, max(0, w - 1), attr)
-            except curses.error:
-                pass
-
-        mode = "ASCII" if self.ascii_mode else "BRAILLE"
-        auto = "AUTO" if self.auto_rotate else "MANUAL"
-        hud = (
-            f" T3B | {self.model.name} | {len(self.model.vertices):,}V "
-            f"{len(self.model.faces):,}F {len(self.model.edges):,}E | "
-            f"{self.last_fps:4.1f} FPS | {mode} | {auto} "
-        )
-        controls = " ARROWS rotate  W/S zoom  Z/C roll  SPACE auto  1 mode  2 colour  H help  Q quit "
-        hud_attr = curses.A_BOLD | (curses.color_pair(1 + self.theme) if curses.has_colors() else 0)
-        try:
-            stdscr.addnstr(h - 2, 0, hud.ljust(w), max(0, w - 1), hud_attr)
-            stdscr.addnstr(h - 1, 0, controls.ljust(w), max(0, w - 1), hud_attr)
-        except curses.error:
-            pass
 
 
 def main() -> int:
@@ -761,13 +958,19 @@ def main() -> int:
     p.add_argument("model", nargs="?", type=Path, help="3D model file. Omit for the built-in cube.")
     p.add_argument("--ascii", action="store_true", help="Use classic one-character ASCII dots instead of Braille.")
     p.add_argument("--fps", type=int, default=30, choices=range(5, 61), metavar="5-60")
-    p.add_argument("--edges", type=int, default=9000, help="Maximum visible wireframe edges.")
+    p.add_argument("--edges", type=int, default=14000, help="Maximum wireframe edges available to the quality system.")
+    p.add_argument(
+        "--quality",
+        choices=("auto", "high", "med", "low"),
+        default="auto",
+        help="Wireframe detail policy (default: auto).",
+    )
     p.add_argument("--fov", type=float, default=70.0, help="Vertical field of view in degrees.")
     args = p.parse_args()
 
     try:
         mesh = load_model(args.model) if args.model else demo_mesh()
-        viewer = Viewer(mesh, args.ascii, args.fps, args.edges, args.fov)
+        viewer = Viewer(mesh, args.ascii, args.fps, args.edges, args.fov, args.quality.upper())
         curses.wrapper(viewer.run)
         return 0
     except KeyboardInterrupt:
@@ -778,7 +981,6 @@ def main() -> int:
     except curses.error as exc:
         print(f"T3B: terminal error: {exc}", file=sys.stderr)
         return 3
-
 
 
 if __name__ == "__main__":
