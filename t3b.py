@@ -654,7 +654,13 @@ class Viewer:
         self.ascii_mode = ascii_mode
         self.max_fps = fps
         self.base_edge_limit = max(500, edge_limit)
-        self.active_edge_limit = self.base_edge_limit
+        self.min_auto_edges = min(self.base_edge_limit, 1800)
+        self.max_auto_edges = self.base_edge_limit
+        self.active_edge_limit = (
+            min(self.base_edge_limit, 6500)
+            if quality.upper() == "AUTO"
+            else self.base_edge_limit
+        )
         self.quality = quality.upper()
         self.fov = max(25.0, min(110.0, fov))
         self.yaw, self.pitch, self.roll = 0.45, -0.25, 0.0
@@ -680,8 +686,6 @@ class Viewer:
         self.status = "READY"
 
         self.target_render_fps = 12.0
-        self.min_auto_edges = min(self.base_edge_limit, max(900, 1800))
-        self.max_auto_edges = self.base_edge_limit
 
     def _calculate_fit_distance(self) -> float:
         half_fov = math.radians(self.fov) * 0.5
